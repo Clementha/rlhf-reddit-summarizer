@@ -16,7 +16,7 @@ MODEL_NAME = "bert-base-uncased"
 BATCH_SIZE = 32
 LR = 1e-5
 EPOCHS = 3  # change as you like
-CHECKPOINT_PATH = "reward_model_last.pt"
+CHECKPOINT_PATH = "./artifacts/reward_model_bert_last.pt"
 
 # -------------------------------
 # Dataset

@@ -13,12 +13,23 @@ from tqdm import tqdm
 # Config
 # -------------------------------
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Setup device
+if torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+    print("Using NVIDIA CUDA GPU acceleration.")
+elif torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+    print("Using Apple MPS GPU acceleration.")
+else:
+    DEVICE = torch.device("cpu")
+    print("No GPU found, falling back to CPU.")
+
+
 MODEL_NAME = "Qwen/Qwen3-0.6B-Base"  # ✅ Qwen model
 BATCH_SIZE = 32
 LR = 1e-5
 EPOCHS = 3
-CHECKPOINT_PATH = "reward_model_last.pt"
+CHECKPOINT_PATH = "./artifacts/reward_model_qwen3-0.6B-Base-last.pt"
 
 # -------------------------------
 # Dataset
