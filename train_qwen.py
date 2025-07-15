@@ -8,6 +8,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from bitsandbytes.optim import Adam8bit
 
 # -------------------------------
 # Config
@@ -26,7 +27,7 @@ else:
 
 
 MODEL_NAME = "Qwen/Qwen3-0.6B-Base"  # ✅ Qwen model
-BATCH_SIZE = 32
+BATCH_SIZE = 1
 LR = 1e-5
 EPOCHS = 3
 CHECKPOINT_PATH = "./artifacts/reward_model_qwen3-0.6B-Base-last.pt"
@@ -61,7 +62,12 @@ def collate_fn(batch):
         rejected_summary = summaries[1 - choice]["text"]
         chosen.append(chosen_summary)
         rejected.append(rejected_summary)
-    chosen_enc = tokenizer(chosen, padding=True, truncation=True, return_tensors="pt")
+    chosen_enc = tokenizer(
+        chosen, 
+        padding=True, 
+        truncation=True,
+        max_length=128,  # was 512 or default, reduce to save memory
+        return_tensors="pt")
     rejected_enc = tokenizer(rejected, padding=True, truncation=True, return_tensors="pt")
     return {
         "chosen_input_ids": chosen_enc["input_ids"],
@@ -85,6 +91,7 @@ class RewardModel(nn.Module):
     def __init__(self, encoder_name):
         super().__init__()
         self.encoder = AutoModel.from_pretrained(encoder_name)
+        self.encoder.gradient_checkpointing_enable()  # Big save for RAM
         self.reward_head = nn.Linear(self.encoder.config.hidden_size, 1)
 
     def forward(self, input_ids, attention_mask):
@@ -107,7 +114,12 @@ if os.path.exists(CHECKPOINT_PATH):
     model.load_state_dict(torch.load(CHECKPOINT_PATH))
     print(f"✅ Loaded checkpoint from {CHECKPOINT_PATH}")
 
-optimizer = optim.AdamW(
+# optimizer = optim.AdamW(
+#     filter(lambda p: p.requires_grad, model.parameters()),
+#     lr=LR
+# )
+
+optimizer = Adam8bit(
     filter(lambda p: p.requires_grad, model.parameters()),
     lr=LR
 )
@@ -157,6 +169,7 @@ for epoch in range(EPOCHS):
         loss.backward()
         optimizer.step()
         scheduler.step()
+        torch.cuda.empty_cache()
 
     avg_loss = epoch_loss / len(dataloader)
     print(f"✅ Epoch {epoch+1} done. Avg loss: {avg_loss:.4f}")
