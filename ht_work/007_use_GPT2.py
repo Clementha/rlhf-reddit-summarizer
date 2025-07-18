@@ -1,5 +1,6 @@
 import os
 import torch
+import wandb
 from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForCausalLM,
@@ -75,7 +76,7 @@ def load_and_prepare_data(dataset, tokenizer):
 ds_train = load_dataset("openai/summarize_from_feedback", "comparisons")
 train_dataset = ds_train["train"]
 val_dataset = ds_train["validation"]
-num_epochs = 1
+num_epochs = 5
 
 # -- Model and Tokenizer
 model_name = "distilbert/distilgpt2"
@@ -119,6 +120,23 @@ lr_scheduler = get_scheduler("linear", optimizer=optimizer, num_warmup_steps=500
 
 scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
+wandb.init(
+    project="summarization-distilgpt2",
+    config={
+        "model_name": model_name,
+        "epochs": num_epochs,
+        "batch_size": 4,
+        "learning_rate": 5e-5,
+        "lr_scheduler": "linear",
+        "lora_r": lora_config.r,
+        "lora_alpha": lora_config.lora_alpha,
+        "lora_dropout": lora_config.lora_dropout,
+    }
+)
+
+
+
+
 # -- Training Loop
 model.train()
 for epoch in range(num_epochs):
@@ -138,11 +156,19 @@ for epoch in range(num_epochs):
         lr_scheduler.step()
 
         total_loss += loss.item()
-        progress_bar.set_description(f"Train Loss: {total_loss / (step + 1):.4f}")
+        avg_loss = total_loss / (step + 1)
+        progress_bar.set_description(f"Train Loss: {avg_loss:.4f}")
+        wandb.log({"train/loss": avg_loss, "epoch": epoch, "step": step})  # ✨ wandb
 
 # -- Save model for PPO
 save_dir = "./trained_models/distilgpt2-sft-summarization"
 os.makedirs(save_dir, exist_ok=True)
 model.save_pretrained(save_dir)
 tokenizer.save_pretrained(save_dir)
+
+artifact = wandb.Artifact("distilgpt2-sft-model", type="model")
+artifact.add_dir(save_dir)
+wandb.log_artifact(artifact)
+wandb.finish()
+
 print(f"Model saved to {save_dir}")

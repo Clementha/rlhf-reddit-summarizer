@@ -1,3 +1,4 @@
 artifacts/
 *.pt
 wandb/
+trained_models/

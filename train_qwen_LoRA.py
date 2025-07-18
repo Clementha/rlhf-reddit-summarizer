@@ -21,10 +21,10 @@ from tqdm import tqdm
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_NAME = "Qwen/Qwen3-0.6B-Base"
-BATCH_SIZE = 1
+BATCH_SIZE = 5
 LR = 1e-5
 EPOCHS = 3
-CHECKPOINT_PATH = "reward_model_last_Qwen_loRA.pt"
+CHECKPOINT_PATH = "./artifacts/qwen_loRA"
 
 # -------------------------------
 # Dataset
@@ -35,6 +35,8 @@ dataset = load_dataset(
     "comparisons",
     split="train"
 )
+
+# dataset = dataset.select(range(5000))  # For testing, use a small subset
 
 print(f"Dataset length: {len(dataset)}")
 
@@ -93,12 +95,15 @@ class RewardModel(nn.Module):
             inference_mode=False,
             r=8,
             lora_alpha=16,
-            lora_dropout=0.05
+            lora_dropout=0.05,
+            target_modules=["q_proj", "v_proj"]
         )
 
         base_model = AutoModelForCausalLM.from_pretrained(encoder_name)
         self.encoder = get_peft_model(base_model, lora_config)
         self.encoder.gradient_checkpointing_enable()
+
+        # print(self.encoder) # Debug: print model structure
 
         self.reward_head = nn.Linear(self.encoder.config.hidden_size, 1)
 
@@ -116,15 +121,15 @@ class RewardModel(nn.Module):
 
 model = RewardModel(MODEL_NAME).to(DEVICE)
 
-print("\n🔍 Trainable params:")
-for name, param in model.named_parameters():
-    if param.requires_grad:
-        print(f"{name:60} {param.shape}")
+# print("\n🔍 Trainable params:")
+# for name, param in model.named_parameters():
+#     if param.requires_grad:
+#         print(f"{name:60} {param.shape}")
 
 # Load checkpoint if exists
-if os.path.exists(CHECKPOINT_PATH):
-    model.load_state_dict(torch.load(CHECKPOINT_PATH))
-    print(f"✅ Loaded checkpoint from {CHECKPOINT_PATH}")
+# if os.path.exists(CHECKPOINT_PATH):
+#     model.load_state_dict(torch.load(CHECKPOINT_PATH))
+#     print(f"✅ Loaded checkpoint from {CHECKPOINT_PATH}")
 
 # -------------------------------
 # Optimizer: bitsandbytes Adam8bit
@@ -157,7 +162,7 @@ for epoch in range(EPOCHS):
     print(f"\n🚀 Starting epoch {epoch+1}/{EPOCHS}...")
     epoch_loss = 0.0
 
-    for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}")):
+    for batch_idx, batch in enumerate(tqdm(dataloader, desc=f"Epoch {epoch+1}", ncols=0)):
         chosen_ids = batch["chosen_input_ids"].to(DEVICE)
         chosen_mask = batch["chosen_attention_mask"].to(DEVICE)
         rejected_ids = batch["rejected_input_ids"].to(DEVICE)
@@ -166,11 +171,11 @@ for epoch in range(EPOCHS):
         chosen_rewards = model(chosen_ids, chosen_mask)
         rejected_rewards = model(rejected_ids, rejected_mask)
 
-        if batch_idx % 100 == 0:
+        if batch_idx % 500 == 0:
             diff_mean = (chosen_rewards - rejected_rewards).mean().item()
-            print(f"[Batch {batch_idx}] Chosen mean: {chosen_rewards.mean().item():.4f} | "
-                  f"Rejected mean: {rejected_rewards.mean().item():.4f} | "
-                  f"Diff mean: {diff_mean:.4f} | "
+            print(f"[Batch {batch_idx}] Chosen mean: {chosen_rewards.mean().item():.2f} | "
+                  f"Rejected mean: {rejected_rewards.mean().item():.2f} | "
+                  f"Diff mean: {diff_mean:.2f} | "
                   f"LR: {scheduler.get_last_lr()[0]:.8f}")
 
         loss = pairwise_loss(chosen_rewards, rejected_rewards)
@@ -185,7 +190,10 @@ for epoch in range(EPOCHS):
     avg_loss = epoch_loss / len(dataloader)
     print(f"✅ Epoch {epoch+1} done. Avg loss: {avg_loss:.4f}")
 
-    torch.save(model.state_dict(), CHECKPOINT_PATH)
+    # torch.save(model.state_dict(), CHECKPOINT_PATH)
+    os.makedirs(CHECKPOINT_PATH, exist_ok=True)
+    model.encoder.save_pretrained(CHECKPOINT_PATH)
+    torch.save(model.reward_head.state_dict(), os.path.join(CHECKPOINT_PATH, "reward_head.pt"))
     print(f"💾 Saved checkpoint to {CHECKPOINT_PATH}")
 
 print("🎉 Training complete!")
