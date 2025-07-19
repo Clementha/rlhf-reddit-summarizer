@@ -11,6 +11,7 @@ from peft import PeftModel
 from datasets import load_dataset
 from tqdm import tqdm
 import wandb
+from peft import PeftModel, PeftConfig
 import warnings
 warnings.filterwarnings("ignore", message="Setting `pad_token_id`")
 warnings.filterwarnings("ignore", message="None of the inputs have requires_grad")
@@ -45,23 +46,35 @@ policy = policy.to(DEVICE)
 
 # 🧠 Reward model
 class RewardModel(torch.nn.Module):
-    def __init__(self, encoder_name):
+    def __init__(self, model_path):
         super().__init__()
-        base = AutoModelForCausalLM.from_pretrained(encoder_name)
-        self.reward_head = torch.nn.Linear(base.config.hidden_size, 1)
+        config = PeftConfig.from_pretrained(model_path)
+        base = AutoModelForCausalLM.from_pretrained(config.base_model_name_or_path)
+        self.encoder = PeftModel.from_pretrained(base, model_path)
+        self.reward_head = torch.nn.Linear(self.encoder.config.hidden_size, 1)
+        self.reward_head.load_state_dict(torch.load(os.path.join(model_path, "reward_head.pt")))
+        self.encoder.eval()
 
     def score(self, hidden_states):
         pooled = hidden_states[:, -1, :]
         return self.reward_head(pooled).squeeze(-1)
 
-reward_model = RewardModel(MODEL_NAME).half().to(DEVICE)
+reward_model = RewardModel("./artifacts/qwen_loRA").half().to(DEVICE)
 reward_model.eval()
 
 # 📄 Load and preprocess dataset
-raw_dataset = load_dataset("openai/summarize_from_feedback", "comparisons", split="train[:1000]")
+raw_dataset = load_dataset("openai/summarize_from_feedback", "comparisons", split="train[:5000]")
 
 def preprocess(example):
-    return {"query": example["info"]["post"][:128]}  # safe truncation
+    # Truncate post to 256 tokens using tokenizer
+    encoding = tokenizer(
+        example["info"]["post"],
+        max_length=256,
+        truncation=True,
+        return_tensors="pt"
+    )
+    text = tokenizer.decode(encoding["input_ids"][0], skip_special_tokens=True)
+    return {"query": text}
 
 processed_dataset = raw_dataset.map(preprocess)
 
@@ -77,7 +90,7 @@ def tokenize(example):
 dataset = processed_dataset.map(tokenize, remove_columns=processed_dataset.column_names)
 dataset.set_format(type="torch")
 data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
-loader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=data_collator)
+loader = DataLoader(dataset, batch_size=BATCH_SIZE, collate_fn=data_collator, shuffle=True)
 
 # 🧮 PPO loss
 def compute_ppo_loss(old_logprobs, new_logprobs, advantages, returns, values, clip_range=0.2, vf_coef=0.5, ent_coef=0.01):
@@ -103,19 +116,24 @@ for epoch in range(EPOCHS):
         input_texts = tokenizer.batch_decode(input_ids, skip_special_tokens=True)
 
         with torch.no_grad():
-            response_ids = policy.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=True,
-                top_k=50,
-                use_cache=False,
-                pad_token_id=tokenizer.pad_token_id,  # Explicitly set to avoid warning
-            )
-            responses = tokenizer.batch_decode(response_ids, skip_special_tokens=True)
+                response_ids = policy.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    do_sample=True,
+                    top_k=50,
+                    use_cache=False,
+                    pad_token_id=tokenizer.pad_token_id
+                )
 
-        # Tokenize full prompt+response
-        full_texts = [q + r for q, r in zip(input_texts, responses)]
+        # Only decode newly generated part
+        gen_len = response_ids.shape[1] - input_ids.shape[1]
+        responses = [tokenizer.decode(resp[-gen_len:], skip_special_tokens=True) for resp in response_ids]
+
+        # 🧼 Add clear separation between prompt and output
+        full_texts = [q.strip() + "\n\n" + r.strip() for q, r in zip(input_texts, responses)]
+
+        # Tokenize for full input
         full_inputs = tokenizer(full_texts, return_tensors="pt", padding=True, truncation=True, max_length=MAX_LEN).to(DEVICE)
 
         logits = policy(**full_inputs).logits
@@ -135,6 +153,33 @@ for epoch in range(EPOCHS):
             rewards = reward_model.score(hidden)
             advantages = rewards - values
             returns = rewards
+            reward_mean = rewards.mean().item()
+            reward_std = rewards.std().item()
+            reward_min = rewards.min().item()
+            reward_max = rewards.max().item()
+
+            # Print debug info for every N steps
+            if i % 100 == 0 or reward_std < 0.01 or reward_mean < 0.0:
+                reward_val = rewards.squeeze().item()
+                value_val = values.squeeze().item()
+                adv_val = (rewards - values).squeeze().item()
+                print("🧪 Sanity Check @ step", i)
+                print("Prompt:    ", input_texts[0])
+                print("Output:    ", responses[0])
+                print("Combined:  ", full_texts[0])
+                print(f"Reward:    {reward_val:.4f}")
+                print(f"Value:     {value_val:.4f}")
+                print(f"Advantage: {adv_val:.4f}")
+
+            if reward_std < 0.01 or reward_mean < 0.0:  # 🔥 Example bad batch condition
+                print(f"⚠️ Bad batch at step {i}")
+                print(f"Prompt:    {input_texts[0]}")
+                print(f"Output:    {responses[0]}")
+                print(f"Combined:  {full_texts[0]}")
+                print(f"Reward:    {rewards[0].item():.4f}")
+                print(f"Value:     {values[0].item():.4f}")
+                print(f"Advantage: {(rewards[0] - values[0]).item():.4f}")
+
             old_logprobs = new_logprobs.detach()
 
         loss, pl, vl, ent = compute_ppo_loss(old_logprobs, new_logprobs, advantages, returns, values)
@@ -145,12 +190,20 @@ for epoch in range(EPOCHS):
             optimizer.step()
             optimizer.zero_grad()
 
+        delta = (rewards - values).cpu().tolist()
         wandb.log({
             "total_loss": loss.item(),
             "policy_loss": pl.item(),
             "value_loss": vl.item(),
             "entropy": ent.item(),
-            "reward": rewards.mean().item()
+            "reward": reward_mean,
+            "reward_std": reward_std,
+            "reward_min": reward_min,
+            "reward_max": reward_max,
+            "value": values.mean().item(),
+            "debug/advantage_vector": delta,
+            "debug/max_advantage": max(delta),
+            "debug/min_advantage": min(delta)
         })
 
         step += 1
